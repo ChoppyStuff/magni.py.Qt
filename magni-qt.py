@@ -1,0 +1,679 @@
+#!/usr/bin/python3
+# Open camera preview, wait for button/key press event on raspi and react by
+# adapting camera parameters
+import asyncio
+from datetime import datetime
+import evdev                   # for input from mouse and command line
+from gpiozero import Button    # for external buttons
+
+# load available camera lib (picamera on legacy, picamera2 on newer OS) 
+try:
+    from picamera import PiCamera  # Import camera functions
+    print("Using picamera")
+except ImportError:
+    pass
+try:
+    from picamera2 import Picamera2, Preview, MappedArray
+    from libcamera import controls, Transform
+    print("Using picamera2 and libcamera")
+except ImportError:
+    pass
+
+# numpy and cv2 are only needed for the overlay text
+try:
+    import cv2
+    print("Using cv2")
+    import numpy as np
+    print("Using numpy")
+except ImportError:
+    pass
+
+import os                      # for background OCR and TTS process
+import re                      # for parsing fbset output
+import signal                  # to kill background process 
+import subprocess              # for calling fbset to detect screen resolution and readout
+import sys                     # for checking if modules are loaded
+import time
+# You can adapt this script to your specific setup, by changing the constants 
+# SCALE_FACTORS can be modified for a fixed set of scale factors
+# PIN_NUMBER_... can be changed if you connect buttons to different GPIO pins
+
+# Picamera2 needs the screen resolution for preview
+# Default is full HD, will try to read actual values in init_camera
+SCREEN_WIDTH = 1920
+SCREEN_HEIGHT = 1080
+
+# Rotate view by 180 degrees for the typical use-case with camera behind object
+ROTATION = 180
+
+# Increase contrast to make text more readable
+# 1 is default, bigger numbers increase contrast
+CONTRAST = 1
+
+# Increase brightness for more clarity, 0 is default, range -1..1
+BRIGHTNESS = 0.2
+
+# Increase saturation for stronger colours, 1 is default, range 0..32
+SATURATION = 1
+
+# Increase sharpness, 1 is default, range 0..16
+SHARPNESS = 1
+
+# Distance in cm between camera objective and the surface (e.g. table)
+# Adapt this if you have a camera v3 in fixed setup and want to fix the focus
+# The default None will run autofocus on each change of magnification
+DISTANCE_TO_SURFACE_CM = None # replace with your distance, e.g. 24.5
+
+# Pre-defined scale factors to cycle through with button/enter
+# These factors are camera pixels to screen pixels ratio, the actual
+# magnification depends also on the camera, the screen size and the distance
+# between camera and object
+DEFAULT_FACTOR = 1.5
+SCALE_FACTORS = [DEFAULT_FACTOR, 3, 4.5, 8]
+factor = SCALE_FACTORS[0]  # use first entry as initial factor on boot up
+
+# Language codes for readout, need to be installed on your system
+OCR_LANG = 'eng'   # Tesseract's character recognition: eng, deu, spa, fra, ita
+TTS_LANG = 'en-GB' # Pico's Text to Speech: en-GB, en-US, de-DE, es-ES, fr-FR, it-IT
+
+AUDIO = 'aplay'
+# uncomment next line to get audio via HDMI, see https://forums.raspberrypi.com/viewtopic.php?t=351718
+# AUDIO = 'aplay -D sysdefault:CARD=vc4hdmi'
+
+# define GPIO pins for (optional) push buttons
+PIN_NUMBER_SCALE =  4 # physical 7, scale button
+PIN_NUMBER_COLOR = 18 # physical 12, colour mode button
+
+# some color definitions (as RGB colors), add your own
+BLACK = (0, 0, 0)
+WHITE = (255, 255, 255)
+RED = (255, 0, 0)
+GREEN = (0, 255, 0)
+BLUE = (0, 0, 255)
+YELLOW = (255, 255, 0)
+
+# Available color modes to step through
+# Add, remove or reorder as needed
+# For regular (unmodified) colors, use None
+COLOR_MODES = [
+    None, # normal colors
+    ('White on Black', WHITE, BLACK),
+    ('Yellow on Blue', YELLOW, BLUE),
+    ('Green on Black', GREEN, BLACK),
+]
+
+# Enable overlay text for debugging
+ENABLE_OVERLAY = False
+OVERLAY_DURATION_S = 3
+
+# Readout uses a background process to run OCR and TTS
+bg_process = None
+
+# fbset is supported on new and legacy OS
+# shows actual framebuffer resolution instead of physical screen size
+
+def screen_resolution_fbset():
+    # Prefer the connected HDMI monitor's advertised resolution.
+    # DRM lists the preferred mode first on this system.
+    try:
+        import glob
+
+        for status_file in sorted(
+            glob.glob('/sys/class/drm/card*-HDMI-A-*/status')
+        ):
+            with open(status_file) as f:
+                if f.read().strip() != 'connected':
+                    continue
+
+            modes_file = status_file.replace('/status', '/modes')
+
+            with open(modes_file) as f:
+                for line in f:
+                    match = re.fullmatch(
+                        r'\s*(\d+)x(\d+)\s*', line
+                    )
+                    if match:
+                        width = int(match.group(1))
+                        height = int(match.group(2))
+                        print(
+                            f'HDMI resolution detected: '
+                            f'{width}x{height}'
+                        )
+                        return width, height
+
+    except (OSError, ValueError) as e:
+        print(f'HDMI resolution detection failed: {e}')
+
+    # Fallback to the framebuffer if HDMI detection fails.
+    return screen_resolution_fbset_fallback()
+
+# show text on screen for a duration given in seconds
+def overlay(text, duration_s = OVERLAY_DURATION_S):
+    global camera
+
+    if ENABLE_OVERLAY and 'numpy' in sys.modules and 'cv2' in sys.modules:
+        colour = (255, 0, 0, 255)
+        origin = (0, 50)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 1
+        thickness = 2
+        buffer = np.zeros((200, 400, 4), dtype=np.uint8)
+        cv2.putText(buffer, text, origin, font, scale, colour, thickness)
+        camera.set_overlay(buffer)
+
+        if duration_s == 0:
+            overlay.content = None
+        else:
+            ts_now = datetime.timestamp(datetime.now())
+            ts_end = ts_now + duration_s
+            overlay.content = (text, ts_end)
+
+# Create a colormap / palette as gradient from one color to another
+# The colors are given as 8 bit RGB tuple
+def colormap(color1, color2):
+    palette = np.zeros((256, 1, 3), dtype=np.uint8)
+    for i in range(256):
+        palette[i, 0, 0] = int(color1[0] + i * (color2[0] - color1[0]) / 255)
+        palette[i, 0, 1] = int(color1[1] + i * (color2[1] - color1[1]) / 255)
+        palette[i, 0, 2] = int(color1[2] + i * (color2[2] - color1[2]) / 255)
+    return palette
+
+# called on each frame with picamera2 to modify the colors
+def color_mode_callback(request):
+    # XRGB8888 uses 4 bytes per pixel.
+    if hasattr(color_mode, 'is_inverted') and color_mode.is_inverted:
+        with MappedArray(request, "main") as m:
+            m.array[..., :3] = 255 - m.array[..., :3]
+
+    elif hasattr(color_mode, 'index') and COLOR_MODES[color_mode.index] is not None:
+        name, dark, light = COLOR_MODES[color_mode.index]
+
+        with MappedArray(request, "main") as m:
+            # Convert the image to grayscale.
+            buffer = cv2.cvtColor(m.array[..., :3], cv2.COLOR_BGR2GRAY)
+
+            # Apply the selected colour map.
+            heatmap = cv2.applyColorMap(buffer, colormap(dark, light))
+
+            # Copy the three colour channels into the 4-channel buffer.
+            m.array[..., :3] = heatmap
+
+# called on each frame by picamera2 for modifications like color modes
+def pre_callback(request):
+    color_mode_callback(request)
+
+    if ENABLE_OVERLAY and hasattr(overlay, 'content') and overlay.content != None:
+        # remove overlay text if display duration is over
+        text, ts_end = overlay.content
+        ts_now = datetime.timestamp(datetime.now())
+        if ts_now > ts_end:
+            overlay('', 0)
+
+def color_mode():
+    global camera
+    if hasattr(camera, 'image_effect'):
+        # in legacy picamera toggle between normal and inverted colours
+        camera.image_effect = 'none' if camera.image_effect == 'negative' else 'negative'
+    elif 'numpy' in sys.modules and 'cv2' in sys.modules:
+        # if opencv is installed with picamera2, step through predefined color modes
+        if not hasattr(color_mode, 'index'):
+            color_mode.index = 0
+        color_mode.index = (color_mode.index + 1) % len(COLOR_MODES)
+    else:
+        # otherwise invert only (doesn't need opencv)
+        if not hasattr(color_mode, 'is_inverted'):
+            color_mode.is_inverted = False
+        color_mode.is_inverted = not color_mode.is_inverted
+
+# react on button pressed
+def next_factor():
+    global factor
+        
+    # find the highest entry in SCALE_FACTORS that is <= current factor
+    # if the current factor is less due to direct input, switch to default value
+    same_or_less = [v for v in SCALE_FACTORS if v <= factor]
+    if len(same_or_less) == 0:
+        factor = DEFAULT_FACTOR
+    else:
+        # step to next scale factor, after last entry go back to first
+        closest_factor = max(same_or_less)
+        i = SCALE_FACTORS.index(closest_factor)
+        i_next = (i + 1) % len(SCALE_FACTORS)
+        factor = SCALE_FACTORS[i_next]
+    
+    scale(factor)
+    
+    
+# change to given scale factor
+# always start in top left corner to maintain the same reading position
+def scale(new_factor):
+    global camera
+    global factor
+    global screen
+    
+    # ensure that factor is at least 1
+    factor = max(1, new_factor)
+
+    # in legacy OS update roi value
+    if hasattr(camera, 'crop'):
+        # offset and width / height in range [0,1]
+        diameter = min(1 / factor, 1)
+        camera.crop = (0, 0, diameter, diameter)
+        return
+
+    # in current OS compute pixel positions in sensor based on scale factor and screen ratio
+    screen_w, screen_h = screen
+    screen_ratio = screen_w / screen_h
+    x, y, camera_w, camera_h = camera.camera_properties['ScalerCropMaximum']
+
+    crop_w = int(camera_w / factor)
+    crop_h = min(int(crop_w / screen_ratio), camera_h)
+
+    window = (x, y, crop_w, crop_h)
+    camera.set_controls({'ScalerCrop': window})
+    overlay(f'{factor:.2f}')
+    
+    # focus on cropped area if camera supports autofocus
+    if 'AfMode' in camera.camera_controls and DISTANCE_TO_SURFACE_CM is None:
+        camera.set_controls({'AfMode': controls.AfModeEnum.Auto, 'AfMetering': controls.AfMeteringEnum.Windows})
+        camera.set_controls({'AfWindows': [window]})
+        camera.autofocus_cycle()
+
+# change scale factor by given amount
+def zoom(change_by):
+    global factor
+    scale(factor + change_by)
+
+# change brightness by given amount
+def brightness(change_by):
+    global camera
+
+    if hasattr(camera, 'camera_controls') and 'Brightness' in camera.camera_controls:
+        min_val, max_val, def_val = camera.camera_controls['Brightness']
+        if not hasattr(brightness, 'val'):
+            # init static var with default brightness value
+            brightness.val = BRIGHTNESS
+        val = brightness.val + change_by
+        if min_val <= val <= max_val:
+            brightness.val = val
+            camera.set_controls({'Brightness': val})
+            overlay(f'{val:.2f}')
+
+
+# multiply current contrast by given value
+def contrast(multiply_by):
+    global camera
+
+    if hasattr(camera, 'camera_controls') and 'Contrast' in camera.camera_controls:
+        min_contrast, max_contrast, def_contrast = camera.camera_controls['Contrast']
+        if not hasattr(contrast, 'contrast'):
+            # init static var with default contrast value (1)
+            contrast.contrast = CONTRAST
+        val = contrast.contrast * multiply_by
+        if min_contrast <= val <= max_contrast:
+            contrast.contrast = val
+            camera.set_controls({'Contrast': val})
+            overlay(f'{val:.2f}')
+    elif hasattr(camera, 'contrast'):
+        # legacy picamera, uses range from -100 to 100 so just stepping +-10
+        diff = 10 if multiply_by > 1 else -10
+        val = camera.contrast + diff
+        if -100 <= val <= 100:
+            camera.contrast = val
+
+# multiply current saturation by given value
+def saturation(multiply_by):
+    global camera
+    if hasattr(camera, 'camera_controls') and 'Saturation' in camera.camera_controls:
+        min_val, max_val, def_val = camera.camera_controls['Saturation']
+        if not hasattr(saturation, 'val'):
+            # init static var with default value
+            saturation.val = SATURATION
+        val = saturation.val * multiply_by
+        if min_val <= val <= max_val:
+            saturation.val = val
+            camera.set_controls({'Saturation': val})
+            overlay(f'{val:.2f}')
+
+# multiply current sharpness by given value
+def sharpness(multiply_by):
+    global camera
+    if hasattr(camera, 'camera_controls') and 'Sharpness' in camera.camera_controls:
+        min_val, max_val, def_val = camera.camera_controls['Sharpness']
+        if not hasattr(sharpness, 'val'):
+            # init static var with default value
+            sharpness.val = SHARPNESS
+        val = sharpness.val * multiply_by
+        if min_val <= val <= max_val:
+            sharpness.val = val
+            camera.set_controls({'Sharpness': val})
+            overlay(f'{val:.2f}')
+
+# change focus (only on supported cameras like the v3 camera, using picamera2)
+# multiply current LensPosition (in dioptrien, i.e. 1/distance_m) by given factor
+# if None given, autofocus on whole sensor field regardless of current preview
+def focus(multiply_by = None):
+    global camera
+
+    # update autofocus (only supported on picamera2)
+    if hasattr(camera, 'camera_controls') and 'AfMode' in camera.camera_controls:
+        current_val = camera.capture_metadata()['LensPosition']
+        if multiply_by is None:
+            overlay(f'Auto: {current_val:.2f}')
+            camera.set_controls({'AfMode': controls.AfModeEnum.Auto, 'AfMetering': controls.AfMeteringEnum.Auto})
+            camera.autofocus_cycle()
+            current_val = camera.capture_metadata()['LensPosition']
+            overlay(f'Auto: {current_val:.2f}')
+        else:
+            camera.set_controls({'AfMode': controls.AfModeEnum.Manual})
+            val = current_val * multiply_by
+            camera.set_controls({'LensPosition': val})
+            overlay(f'{val:.2f}')
+
+def quit():
+    global devices    
+    asyncio.get_event_loop().stop()
+    for dev in devices:
+        dev.ungrab()
+
+def save_photo(filename = ''):
+    global camera
+    if len(filename) == 0:
+        timestamp = datetime.now().isoformat()
+        filename = f'/home/pi/{timestamp}.jpg'
+    if hasattr(camera, 'capture_file'):
+        # saves the preview stream as an image
+        camera.capture_file(filename)
+    else:
+        camera.stop_preview()
+        camera.capture(filename)
+        camera.start_preview()
+
+def readout():
+    global factor
+    global bg_process
+
+    # remove hyphens at end of line and append the next line, so TTS won't read them out
+    # See https://unix.stackexchange.com/a/26289
+    FIX_HYPHENS = r"perl -i.original -p0e 's/(\w)-[\n]+(\w)/$1$2/igs' tmp.txt"
+
+    # command to run OCR, remove hyphens, play a sound, run TTS and play the result
+    cmd = f'tesseract tmp.jpg tmp -l {OCR_LANG} && {FIX_HYPHENS} && {AUDIO} plop.wav && pico2wave -w tmp.wav -l {TTS_LANG} < tmp.txt && {AUDIO} tmp.wav'
+    overlay('')
+    if bg_process != None and bg_process.poll() == None:
+        # if background process is running, just kill it and do nothing
+        os.killpg(os.getpgid(bg_process.pid), signal.SIGTERM)
+    else:
+        subprocess.call(f'{AUDIO} plop.wav', shell=True)
+        save_photo('tmp.jpg')
+        overlay('Reading')
+        bg_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True, preexec_fn=os.setsid)
+
+# start displaying the default camera view
+def init_camera(width, height):
+    try:
+        # for current OS use picamera2
+        picam2 = Picamera2()
+        transform = Transform(hflip=1, vflip=1) if ROTATION == 180 else Transform()
+        config = picam2.create_preview_configuration(
+            # BGR888 uses 8 bit for actual RGB and no alpha channel
+            # this simplifies color mode changes with opencv
+            main={'size': (width, height), 'format': 'XRGB8888'},
+            transform=transform,
+            controls={'FrameDurationLimits': (33333, 33333)})
+        picam2.configure(config)
+        print("Configured camera:", picam2.camera_configuration())
+        picam2.pre_callback = pre_callback
+        picam2.start_preview(Preview.QTGL, x=0, y=0, width=width, height=height) # no transform!
+        picam2.start()
+        picam2.set_controls({
+            'Brightness': BRIGHTNESS,
+            'Contrast': CONTRAST,
+            'Saturation': SATURATION,
+            'Sharpness': SHARPNESS
+        })
+        if 'AfMode' in picam2.camera_controls:
+            if DISTANCE_TO_SURFACE_CM is None:
+                # if no distance given, use autofocus on magnification change
+                picam2.set_controls({'AfMode': controls.AfModeEnum.Auto})
+                picam2.set_controls({'AfSpeed': controls.AfSpeedEnum.Fast})
+            else:
+                # set focus to the given fixed distance
+                picam2.set_controls({'AfMode': controls.AfModeEnum.Manual})
+                picam2.set_controls({'LensPosition': 100 / DISTANCE_TO_SURFACE_CM})
+
+        print('Started picamera2', ROTATION)
+        print('FrameDurationLimits supported:',
+            picam2.camera_controls.get('FrameDurationLimits', 'Not available'))
+        print('Configured frame duration:',
+            picam2.camera_configuration()['controls'].get('FrameDurationLimits', 'Not reported'))
+        return picam2
+    except:
+        # for legacy OS use picamera
+        camera = PiCamera()
+        camera.rotation = ROTATION
+        camera.start_preview()
+        print('Started legacy picamera', ROTATION)
+        return camera
+
+
+
+# MAGNI_CONTROL_SERVER
+import json
+import socket
+
+def get_magni_status():
+    """Return current magnification, camera settings and metadata."""
+    status = {}
+
+    # Magnification
+    try:
+        status["magnification"] = float(factor)
+    except (NameError, TypeError, ValueError):
+        status["magnification"] = None
+
+    # Actual camera stream resolution
+    try:
+        config = camera.camera_configuration()
+        size = config["main"]["size"]
+        status["resolution"] = f"{size[0]} x {size[1]}"
+    except (AttributeError, KeyError, TypeError, NameError):
+        status["resolution"] = "Unavailable"
+
+    # Read the current application values maintained by the controls.
+    def current_value(function, attribute, default=None):
+        return getattr(function, attribute, default)
+
+    status["brightness"] = current_value(
+        brightness, "val", BRIGHTNESS
+    )
+    status["contrast"] = current_value(
+        contrast, "contrast", CONTRAST
+    )
+    status["saturation"] = current_value(
+        saturation, "val", SATURATION
+    )
+    status["sharpness"] = current_value(
+        sharpness, "val", SHARPNESS
+    )
+
+    # Colour mode
+    if hasattr(color_mode, "index"):
+        index = color_mode.index
+        try:
+            mode = COLOR_MODES[index]
+            status["colour_mode"] = (
+                "Normal" if mode is None else str(mode[0])
+            )
+        except (IndexError, TypeError):
+            status["colour_mode"] = f"Mode {index}"
+    elif hasattr(color_mode, "is_inverted"):
+        status["colour_mode"] = (
+            "Inverted" if color_mode.is_inverted else "Normal"
+        )
+    elif hasattr(camera, "image_effect"):
+        status["colour_mode"] = str(camera.image_effect)
+    else:
+        status["colour_mode"] = "Unknown"
+
+    # Camera metadata
+    try:
+        metadata = camera.capture_metadata()
+    except Exception:
+        metadata = {}
+
+    exposure = metadata.get("ExposureTime")
+    gain = metadata.get("AnalogueGain")
+    lens = metadata.get("LensPosition")
+    frame_duration = metadata.get("FrameDuration")
+
+    status["exposure_us"] = exposure
+    status["analogue_gain"] = gain
+    status["lens_position"] = lens
+    status["fps"] = (
+        round(1_000_000 / frame_duration, 1)
+        if frame_duration else None
+    )
+
+    return status
+
+async def magni_control_client(reader, writer):
+    try:
+        line = await reader.readline()
+        command = line.decode("utf-8").strip()
+        actions = {
+            "zoom_in": lambda: zoom(0.5),
+            "zoom_out": lambda: zoom(-0.5),
+            "brightness_up": lambda: brightness(0.1),
+            "brightness_down": lambda: brightness(-0.1),
+            "contrast_up": lambda: contrast(2),
+            "contrast_down": lambda: contrast(0.5),
+            "saturation_up": lambda: saturation(2),
+            "saturation_down": lambda: saturation(0.5),
+            "sharpness_up": lambda: sharpness(2),
+            "sharpness_down": lambda: sharpness(0.5),
+            "focus_auto": lambda: focus(),
+            "next_color": lambda: color_mode(),
+            "readout": lambda: readout(),
+            "save_photo": lambda: save_photo(),
+        }
+        if command == "get_status":
+            writer.write((json.dumps(get_magni_status()) + "\n").encode("utf-8")
+            )
+        elif command in actions:
+            actions[command]()
+            writer.write(b"OK\n")
+        else:
+            writer.write(b"ERROR: unknown command\n")
+        await writer.drain()
+    except Exception as e:
+        try:
+            writer.write(("ERROR: " + str(e) + "\n").encode())
+            await writer.drain()
+        except Exception:
+            pass
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+async def start_magni_control_server():
+    server = await asyncio.start_server(
+        magni_control_client, "127.0.0.1", 8765
+    )
+    print("Magni control server listening on 127.0.0.1:8765")
+    return server
+
+
+async def handle_events(device):
+    async for event in device.async_read_loop():
+        if event.type == evdev.ecodes.EV_KEY and event.value == 0:
+            code = event.code
+            modifiers = device.active_keys()
+            is_shift = evdev.ecodes.KEY_LEFTSHIFT in modifiers or evdev.ecodes.KEY_RIGHTSHIFT in modifiers
+
+            # mouse buttons
+            if code == evdev.ecodes.BTN_MOUSE: next_factor()
+            elif code == evdev.ecodes.BTN_RIGHT: color_mode()
+            elif code == evdev.ecodes.BTN_MIDDLE: readout()
+
+            # regular keys
+            elif code == evdev.ecodes.KEY_A: focus()
+            elif code == evdev.ecodes.KEY_F and is_shift: focus(0.75)
+            elif code == evdev.ecodes.KEY_F: focus(1.5)
+            elif code == evdev.ecodes.KEY_Q: quit()
+            elif code == evdev.ecodes.KEY_ESC: quit()
+            elif code == evdev.ecodes.KEY_ENTER: next_factor()
+            elif code == evdev.ecodes.KEY_SLASH: color_mode()
+            elif code == evdev.ecodes.KEY_S: save_photo()
+            elif code == evdev.ecodes.KEY_R: readout()
+            elif code == evdev.ecodes.KEY_Z and is_shift: zoom(-0.2)
+            elif code == evdev.ecodes.KEY_Z: zoom(0.2)
+            elif code == evdev.ecodes.KEY_B and is_shift: brightness(-0.1)
+            elif code == evdev.ecodes.KEY_B: brightness(0.1)
+            elif code == evdev.ecodes.KEY_C and is_shift: contrast(0.5)
+            elif code == evdev.ecodes.KEY_C: contrast(2)
+            elif code == evdev.ecodes.KEY_H and is_shift: sharpness(0.5)
+            elif code == evdev.ecodes.KEY_H: sharpness(2)
+            elif code == evdev.ecodes.KEY_T and is_shift: saturation(0.5)
+            elif code == evdev.ecodes.KEY_T: saturation(2)
+            elif code == evdev.ecodes.KEY_0: scale(10)
+            elif code == evdev.ecodes.KEY_1: scale(1)
+            elif code == evdev.ecodes.KEY_2: scale(2)
+            elif code == evdev.ecodes.KEY_3: scale(3)
+            elif code == evdev.ecodes.KEY_4: scale(4)
+            elif code == evdev.ecodes.KEY_5: scale(5)
+            elif code == evdev.ecodes.KEY_6: scale(6)
+            elif code == evdev.ecodes.KEY_7: scale(7)
+            elif code == evdev.ecodes.KEY_8: scale(8)
+            elif code == evdev.ecodes.KEY_9: scale(9)
+
+            # numeric keypad
+            elif code == evdev.ecodes.KEY_KPENTER: next_factor()
+            elif code == evdev.ecodes.KEY_KPSLASH: color_mode()
+            elif code == evdev.ecodes.KEY_KP0: scale(10)
+            elif code == evdev.ecodes.KEY_KP1: scale(1)
+            elif code == evdev.ecodes.KEY_KP2: scale(2)
+            elif code == evdev.ecodes.KEY_KP3: scale(3)
+            elif code == evdev.ecodes.KEY_KP4: scale(4)
+            elif code == evdev.ecodes.KEY_KP5: scale(5)
+            elif code == evdev.ecodes.KEY_KP6: scale(6)
+            elif code == evdev.ecodes.KEY_KP7: scale(7)
+            elif code == evdev.ecodes.KEY_KP8: scale(8)
+            elif code == evdev.ecodes.KEY_KP9: scale(9)
+
+button1 = Button(PIN_NUMBER_SCALE)
+button1.when_pressed = next_factor
+button2 = Button(PIN_NUMBER_COLOR)
+button2.when_pressed = color_mode
+
+screen = screen_resolution_fbset()
+width, height = screen
+camera = init_camera(width, height)
+#width, height = 1920, 1080
+#screen = (width, height)
+#camera = init_camera(width, height)
+scale(factor)
+
+try:
+    devices = [evdev.InputDevice(fn) for fn in evdev.list_devices()]
+    for device in devices:
+        # Leave the touchscreen available to Labwc and Qt.
+        if "Goodix Capacitive TouchScreen" in device.name:
+            print(f"Leaving touchscreen ungrabbed: {device.name}")
+            device.close()
+            continue
+        device.grab()
+        asyncio.ensure_future(handle_events(device))
+    loop = asyncio.get_event_loop()
+    control_server = loop.run_until_complete(start_magni_control_server())
+    try:
+        loop.run_forever()
+    finally:
+        control_server.close()
+        loop.run_until_complete(control_server.wait_closed())
+
+finally:
+    if bg_process != None and bg_process.poll() == None:
+        os.killpg(os.getpgid(bg_process.pid), signal.SIGTERM)
+    camera.stop_preview()
+    camera.close()
