@@ -312,6 +312,9 @@ preferences = QSettings("Magni", "MagniTouch")
 advanced_info_enabled = preferences.value(
     "advanced_info_enabled", False, type=bool
 )
+slow_frame_rate_enabled = preferences.value(
+    "slow_frame_rate_enabled", False, type=bool
+)
 display_rotation = preferences.value("display_rotation", 0, type=int)
 if display_rotation not in (0, 90, 180, 270):
     display_rotation = 0
@@ -397,7 +400,7 @@ if display_rotation:
 
 def open_settings():
     """Open settings and save the advanced-information preference."""
-    global advanced_info_enabled
+    global advanced_info_enabled, slow_frame_rate_enabled
 
     dialog = QDialog(window)
     dialog.setWindowTitle("Magni Settings")
@@ -423,7 +426,13 @@ def open_settings():
     advanced_checkbox = QCheckBox("Show advanced camera information")
     advanced_checkbox.setChecked(advanced_info_enabled)
     dialog_layout.addWidget(advanced_checkbox)
-
+    
+    slow_rate_checkbox = QCheckBox(
+    "Reduce frame rate for colour processing"
+    )
+    slow_rate_checkbox.setChecked(slow_frame_rate_enabled)
+    dialog_layout.addWidget(slow_rate_checkbox)
+    
     note = QLabel(
         "Advanced information includes analogue gain, exposure, "
         "focus position and FPS."
@@ -442,12 +451,47 @@ def open_settings():
 
     if dialog.exec_() == QDialog.Accepted:
         advanced_info_enabled = advanced_checkbox.isChecked()
-        preferences.setValue("advanced_info_enabled", advanced_info_enabled)
-        refresh_tech_info()
+        preferences.setValue(
+            "advanced_info_enabled",
+            advanced_info_enabled
+        )
 
+        requested_slow_rate = slow_rate_checkbox.isChecked()
+
+        command = (
+            "slow_rate_on"
+            if requested_slow_rate
+            else "slow_rate_off"
+        )
+
+        if send_command(command):
+            slow_frame_rate_enabled = requested_slow_rate
+            preferences.setValue(
+                "slow_frame_rate_enabled",
+                slow_frame_rate_enabled
+            )
+            refresh_tech_info()
+        else:
+            QMessageBox.warning(
+                dialog,
+                "Frame rate not changed",
+                "The camera did not accept the frame-rate change. "
+                "Please check that Magni is running and try again."
+            )
 
 settings_button.clicked.connect(open_settings)
 rotation_button.clicked.connect(rotate_display)
+
+def apply_saved_frame_rate():
+    """Restore the saved slow frame-rate setting on startup."""
+    if preferences.value(
+        "slow_frame_rate_enabled", False, type=bool
+    ):
+        send_command("slow_rate_on")
+
+
+# Allow the camera control server time to start.
+QTimer.singleShot(3000, apply_saved_frame_rate)
 
 # Each slider is a relative adjustment control.
 # Moving away from the centre applies the existing Magni step commands.
@@ -677,7 +721,7 @@ def refresh_tech_info():
 
     pi_info.setText(
         f"CPU temp: {temp}\n"
-        f"Memory free: {memory}\n"
+        f"Memory: {memory}\n"
         f"Uptime: {uptime}\n"
         f"System load: {load}\n"
         f"Touch session: {hours:02d}:{minutes:02d}:{seconds:02d}"

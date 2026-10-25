@@ -225,6 +225,8 @@ def color_mode():
             color_mode.is_inverted = False
         color_mode.is_inverted = not color_mode.is_inverted
 
+    update_frame_rate_for_color_mode()
+
 # react on button pressed
 def next_factor():
     global factor
@@ -535,7 +537,54 @@ def get_magni_status():
         if frame_duration else None
     )
 
+    status["slow_frame_rate"] = slow_frame_rate_enabled
+    status["slow_frame_rate_active"] = slow_frame_rate_active
     return status
+
+# False = normal 30 FPS; True = reduced 10 FPS.
+# Whether automatic slow frame rate is enabled in Settings.
+slow_frame_rate_enabled = False
+
+# Whether the camera is currently running at the reduced frame rate.
+slow_frame_rate_active = False
+
+def set_frame_rate_mode(slow):
+    """Set the camera frame rate without restarting the camera."""
+    global slow_frame_rate_active
+
+    frame_duration = 100000 if slow else 33333
+
+    camera.set_controls({
+        "FrameDurationLimits": (frame_duration, frame_duration)
+    })
+
+    slow_frame_rate_active = slow
+
+    print(
+        "Frame rate:",
+        "10 FPS mode" if slow else "30 FPS mode"
+    )
+
+
+def update_frame_rate_for_color_mode():
+    """Use reduced FPS for processed colours when enabled in Settings."""
+    current_index = getattr(color_mode, "index", 0)
+    is_normal_colour = current_index == 0
+
+    use_slow_rate = (
+        slow_frame_rate_enabled and not is_normal_colour
+    )
+
+    if use_slow_rate != slow_frame_rate_active:
+        set_frame_rate_mode(use_slow_rate)
+
+
+def configure_slow_frame_rate(enabled):
+    """Enable or disable automatic slow frame-rate behaviour."""
+    global slow_frame_rate_enabled
+
+    slow_frame_rate_enabled = enabled
+    update_frame_rate_for_color_mode()
 
 async def magni_control_client(reader, writer):
     try:
@@ -554,6 +603,8 @@ async def magni_control_client(reader, writer):
             "sharpness_down": lambda: sharpness(0.5),
             "focus_auto": lambda: focus(),
             "next_color": lambda: color_mode(),
+            "slow_rate_on": lambda: configure_slow_frame_rate(True),
+            "slow_rate_off": lambda: configure_slow_frame_rate(False),
             "readout": lambda: readout(),
             "save_photo": lambda: save_photo(),
         }
@@ -648,6 +699,8 @@ button2.when_pressed = color_mode
 
 screen = screen_resolution_fbset()
 width, height = screen
+print(f"Camera preview resolution: {width}x{height}")
+
 camera = init_camera(width, height)
 #width, height = 1920, 1080
 #screen = (width, height)
