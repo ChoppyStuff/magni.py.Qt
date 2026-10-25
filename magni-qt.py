@@ -14,6 +14,8 @@ except ImportError:
     pass
 try:
     from picamera2 import Picamera2, Preview, MappedArray
+    from picamera2.encoders import H264Encoder
+    from picamera2.outputs import PyavOutput
     from libcamera import controls, Transform
     print("Using picamera2 and libcamera")
 except ImportError:
@@ -34,6 +36,18 @@ import signal                  # to kill background process
 import subprocess              # for calling fbset to detect screen resolution and readout
 import sys                     # for checking if modules are loaded
 import time
+# Video recording state (Picamera2 only).
+VIDEO_WIDTH = 1280
+VIDEO_HEIGHT = 720
+VIDEO_FPS = 30
+VIDEO_BITRATE = 4_000_000
+
+video_encoder = None
+video_output = None
+video_recording = False
+video_started_at = None
+video_filename = None
+
 # You can adapt this script to your specific setup, by changing the constants 
 # SCALE_FACTORS can be modified for a fixed set of scale factors
 # PIN_NUMBER_... can be changed if you connect buttons to different GPIO pins
@@ -401,6 +415,67 @@ def save_photo(filename = ''):
         camera.capture(filename)
         camera.start_preview()
 
+def start_video_recording():
+    """Start recording the clean camera stream to a timestamped MP4."""
+    global video_encoder, video_output
+    global video_recording, video_started_at, video_filename
+
+    if video_recording:
+        return
+
+    if not hasattr(camera, "start_recording"):
+        raise RuntimeError("Video recording requires Picamera2.")
+
+    # Ensure the destination directory exists.
+    video_dir = os.path.expanduser("~/Videos/Magni")
+    os.makedirs(video_dir, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    video_filename = os.path.join(video_dir, f"Magni_{timestamp}.mp4")
+
+    try:
+        video_encoder = H264Encoder(
+            bitrate=VIDEO_BITRATE,
+            framerate=VIDEO_FPS,
+        )
+        video_output = PyavOutput(video_filename)
+
+        camera.start_encoder(
+            video_encoder,
+            video_output,
+            name="lores",
+        )
+
+        video_started_at = time.monotonic()
+        video_recording = True
+        print(f"Started video recording: {video_filename}")
+
+    except Exception:
+        video_encoder = None
+        video_output = None
+        video_recording = False
+        video_started_at = None
+        video_filename = None
+        raise
+
+
+def stop_video_recording():
+    """Stop recording and finalize the MP4 file."""
+    global video_encoder, video_output
+    global video_recording, video_started_at
+
+    if not video_recording:
+        return
+
+    try:
+        camera.stop_encoder()
+        print(f"Saved video recording: {video_filename}")
+    finally:
+        video_recording = False
+        video_started_at = None
+        video_encoder = None
+        video_output = None
+
 def readout():
     global factor
     global bg_process
@@ -428,11 +503,18 @@ def init_camera(width, height):
         picam2 = Picamera2()
         transform = Transform(hflip=1, vflip=1) if ROTATION == 180 else Transform()
         config = picam2.create_preview_configuration(
-            # BGR888 uses 8 bit for actual RGB and no alpha channel
-            # this simplifies color mode changes with opencv
+            # Main stream: touchscreen preview and colour processing.
             main={'size': (width, height), 'format': 'XRGB8888'},
+
+            # Separate clean stream: video recording only.
+            lores={
+                'size': (VIDEO_WIDTH, VIDEO_HEIGHT),
+                'format': 'YUV420',
+            },
+
             transform=transform,
-            controls={'FrameDurationLimits': (33333, 33333)})
+            controls={'FrameDurationLimits': (33333, 33333)},
+        )
         picam2.configure(config)
         print("Configured camera:", picam2.camera_configuration())
         picam2.pre_callback = pre_callback
@@ -572,6 +654,15 @@ def get_magni_status():
         # Legacy camera API or camera without reported AF controls.
         status["autofocus_supported"] = False
 
+    # Video recording status
+    status["video_recording"] = video_recording
+    status["video_filename"] = video_filename
+
+    status["video_elapsed"] = (
+        int(time.monotonic() - video_started_at)
+        if video_recording and video_started_at is not None
+        else 0
+    )
     return status
 
 # False = normal 30 FPS; True = reduced 10 FPS.
@@ -640,6 +731,8 @@ async def magni_control_client(reader, writer):
             "slow_rate_off": lambda: configure_slow_frame_rate(False),
             "readout": lambda: readout(),
             "save_photo": lambda: save_photo(),
+            "start_recording": lambda: start_video_recording(),
+            "stop_recording": lambda: stop_video_recording(),
         }
         if command == "get_status":
             writer.write((json.dumps(get_magni_status()) + "\n").encode("utf-8")

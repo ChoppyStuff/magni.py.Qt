@@ -753,6 +753,7 @@ def read_system_info():
     return cpu_temp, memory, uptime, cpu_load, disk_space
 
 autofocus_button = None
+record_button = None
 
 def refresh_tech_info():
     temp, memory, uptime, load, disk_space = read_system_info()
@@ -800,6 +801,16 @@ def refresh_tech_info():
             else "Autofocus is not supported by this camera"
         )
 
+    if record_button is not None:
+        is_recording = (
+            camera_status is not None
+            and camera_status.get("video_recording") is True
+        )
+        record_button.setText(
+            "Stop Recording" if is_recording else "Record Video"
+        )
+        record_button.setEnabled(camera_status is not None)
+
     if camera_status is None:
         camera_info.setText("Camera status unavailable")
     else:
@@ -816,6 +827,19 @@ def refresh_tech_info():
             f"Sharpness: {show_value(camera_status.get('sharpness'), '{:.2f}')}",
         ]
 
+        is_recording = camera_status.get("video_recording") is True
+        video_elapsed = int(camera_status.get("video_elapsed") or 0)
+        video_minutes, video_seconds = divmod(video_elapsed, 60)
+        video_hours, video_minutes = divmod(video_minutes, 60)
+
+        if is_recording:
+            lines.extend([
+                "● RECORDING VIDEO",
+                f"Recording time: {video_hours:02d}:{video_minutes:02d}:{video_seconds:02d}",
+            ])
+        else:
+            lines.append("Video: Not recording")
+
         if advanced_info_enabled:
             lines.extend([
                 f"FPS: {show_value(camera_status.get('fps'), '{:.1f}')}",
@@ -826,6 +850,22 @@ def refresh_tech_info():
 
         camera_info.setText("\n".join(lines))
     
+def toggle_video_recording():
+    camera_status = get_camera_status()
+    if camera_status is None:
+        status.setText("Camera status unavailable")
+        return
+
+    command = (
+        "stop_recording"
+        if camera_status.get("video_recording") is True
+        else "start_recording"
+    )
+
+    if send_command(command):
+        QTimer.singleShot(200, refresh_tech_info)
+
+
 tech_timer = QTimer(window)
 tech_timer.timeout.connect(refresh_tech_info)
 tech_timer.start(2000)
@@ -862,6 +902,20 @@ for label, command in buttons:
 
     if command == "focus_auto":
         autofocus_button = button
+
+record_button = QPushButton("Record Video")
+record_button.setMinimumHeight(58)
+record_button.setStyleSheet("""
+    QPushButton {
+        font-size: 17px;
+        padding: 3px;
+    }
+    QPushButton:disabled {
+        color: #888888;
+    }
+""")
+record_button.clicked.connect(toggle_video_recording)
+buttons_layout.addWidget(record_button, 1)
 
 off_button = QPushButton("Shutdown")
 off_button.setMinimumHeight(58)
