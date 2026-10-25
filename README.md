@@ -1,6 +1,6 @@
 # Magni.py Qt — Touchscreen Edition
 
-A customised version of Magni.py Qt for a Raspberry Pi, adding a dedicated touchscreen interface for controlling the magnifier.  The original Magni.py source have been replaced with **magni-qt.py** and **magni_touch.py**.  The original OCR code is currently disabled, and can easily be reinstated.
+A customised version of Magni.py Qt for a Raspberry Pi, adding a dedicated touchscreen interface for controlling the magnifier.  The original Magni.py source is included here for comparison, but has been replaced with **magni-qt.py** and **magni_touch.py**.  The original OCR code is currently disabled, and can easily be reinstated.
 
 ## Features
 
