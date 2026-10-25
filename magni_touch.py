@@ -6,6 +6,7 @@ import sys
 import os
 import time
 import json
+import shutil
 
 from PyQt5.QtCore import Qt, QTimer, QSettings
 from PyQt5.QtWidgets import (
@@ -663,6 +664,24 @@ columns.setColumnStretch(1, 1)
 
 body_layout.addWidget(tech_panel, 2)
 
+def read_pi_model():
+    """Read the Raspberry Pi model and optional board revision."""
+    import re
+
+    try:
+        with open("/proc/device-tree/model", "r") as f:
+            description = f.read().strip("\x00\n ")
+
+        match = re.match(r"^(.*?)\s+Rev\s+(\S+)\s*$", description, re.IGNORECASE)
+
+        if match:
+            return match.group(1), match.group(2)
+
+        return description, "Unknown"
+
+    except OSError:
+        return "Unknown Raspberry Pi model", "Unknown"
+
 start_time = time.monotonic()
 
 
@@ -672,6 +691,7 @@ def read_system_info():
     memory = "Unavailable"
     uptime = "Unavailable"
     cpu_load = "Unavailable"
+    disk_space = "Unavailable"
 
     try:
         with open("/sys/class/thermal/thermal_zone0/temp") as f:
@@ -709,24 +729,37 @@ def read_system_info():
     except OSError:
         pass
 
-    return cpu_temp, memory, uptime, cpu_load
+    try:
+        usage = shutil.disk_usage("/")
+        gib = 1024 ** 3
+        used = (usage.total - usage.free) / gib
+        total = usage.total / gib
+        #free = usage.free / gib
+        disk_space = f"{used:.1f}/{total:.1f} GiB used"
+    except OSError:
+        pass
+
+    return cpu_temp, memory, uptime, cpu_load, disk_space
 
 
 def refresh_tech_info():
-    temp, memory, uptime, load = read_system_info()
-
+    temp, memory, uptime, load, disk_space = read_system_info()
+    pi_model, pi_revision = read_pi_model()
+    
     elapsed = int(time.monotonic() - start_time)
     hours, remainder = divmod(elapsed, 3600)
     minutes, seconds = divmod(remainder, 60)
 
     pi_info.setText(
+        f"Model: {pi_model}\n"
+        f"Revision: {pi_revision}\n"
         f"CPU temp: {temp}\n"
         f"Memory: {memory}\n"
+        f"Disk: {disk_space}\n"
         f"Uptime: {uptime}\n"
         f"System load: {load}\n"
         f"Touch session: {hours:02d}:{minutes:02d}:{seconds:02d}"
     )
-
     # These are touchscreen adjustment steps, not confirmed camera values.
     adjustment_lines = []
 
