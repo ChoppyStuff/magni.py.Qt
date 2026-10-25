@@ -17,9 +17,10 @@ The touchscreen application communicates with the main camera application throug
 
 Designed for a Raspberry Pi running Raspberry Pi OS, with:
 
+- Raspberry PI.  This was developed on a Raspberry Pi 3 with 1Gb memory.  This should be considered an absolute minimum spec. 
 - A compatible Raspberry Pi camera, tested with the Camera Module v2.1 (IMX219).
 - An HDMI display for the magnified image.
-- A DSI touchscreen for the control interface.
+- A DSI touchscreen for the control interface. Designed on 5", should work fine on other sizes.
 - A Wayland desktop environment using Labwc.
 
 The touchscreen code uses PyQt5. Display rotation relies on `wlr-randr`, and the applications require access to the camera and any configured GPIO or input devices.
