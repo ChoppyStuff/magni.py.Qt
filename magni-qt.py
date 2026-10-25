@@ -529,6 +529,17 @@ def get_magni_status():
         status["colour_mode"] = "Unknown"
 
     # Camera metadata
+    # Autofocus capability
+    try:
+        available_controls = camera.camera_controls
+        status["autofocus_supported"] = (
+            "AfMode" in available_controls
+            and "AfTrigger" in available_controls
+        )
+    except (AttributeError, TypeError):
+        # Legacy PiCamera and cameras without reported AF controls.
+        status["autofocus_supported"] = False
+    
     try:
         metadata = camera.capture_metadata()
     except Exception:
@@ -549,6 +560,18 @@ def get_magni_status():
 
     status["slow_frame_rate"] = slow_frame_rate_enabled
     status["slow_frame_rate_active"] = slow_frame_rate_active
+    
+    # Detect whether the camera supports autofocus.
+    try:
+        controls_available = camera.camera_controls
+        status["autofocus_supported"] = (
+            "AfMode" in controls_available
+            and "AfTrigger" in controls_available
+        )
+    except (AttributeError, TypeError):
+        # Legacy camera API or camera without reported AF controls.
+        status["autofocus_supported"] = False
+
     return status
 
 # False = normal 30 FPS; True = reduced 10 FPS.

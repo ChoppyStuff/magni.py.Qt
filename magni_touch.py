@@ -48,27 +48,38 @@ def get_camera_status():
     return None
 
 def send_command(command):
-    """Send one existing command to the Magni control server."""
-    try:
-        with socket.create_connection((HOST, PORT), timeout=3) as sock:
-            sock.settimeout(5)
-            sock.sendall((command + "\n").encode())
-            response = b""
+    """Send a command to the Magni control server."""
+    last_error = None
 
-            while not response.endswith(b"\n"):
-                chunk = sock.recv(256)
-                if not chunk:
-                    break
-                response += chunk
+    for attempt in range(4):
+        try:
+            with socket.create_connection((HOST, PORT), timeout=3) as sock:
+                sock.settimeout(5)
+                sock.sendall((command + "\n").encode())
+                response = b""
 
-        result = response.decode().strip() or "No response"
-        status.setText(result)
-        return result == "OK"
+                while not response.endswith(b"\n"):
+                    chunk = sock.recv(256)
+                    if not chunk:
+                        break
+                    response += chunk
 
-    except Exception as exc:
-        status.setText("Connection error: " + str(exc))
-        return False
+            result = response.decode().strip() or "No response"
+            status.setText(result)
+            return result == "OK"
 
+        except ConnectionRefusedError as exc:
+            last_error = exc
+            if attempt < 3:
+                time.sleep(0.5)
+
+        except Exception as exc:
+            status.setText("Connection error: " + str(exc))
+            return False
+
+    # The server may still be starting. Don't show a misleading error.
+    print(f"Magni server not ready; command '{command}' was not sent: {last_error}")
+    return False
 
 def shutdown_pi():
     """Show a large touchscreen confirmation before shutting down."""
@@ -741,6 +752,7 @@ def read_system_info():
 
     return cpu_temp, memory, uptime, cpu_load, disk_space
 
+autofocus_button = None
 
 def refresh_tech_info():
     temp, memory, uptime, load, disk_space = read_system_info()
@@ -776,6 +788,17 @@ def refresh_tech_info():
 
     camera_status = get_camera_status()
 
+    if autofocus_button is not None:
+        autofocus_supported = (
+            camera_status is not None
+            and camera_status.get("autofocus_supported") is True
+        )
+        autofocus_button.setEnabled(autofocus_supported)
+        autofocus_button.setToolTip(
+            "Autofocus is supported"
+            if autofocus_supported
+            else "Autofocus is not supported by this camera"
+        )
 
     if camera_status is None:
         camera_info.setText("Camera status unavailable")
@@ -828,11 +851,17 @@ for label, command in buttons:
             font-size: 17px;
             padding: 3px;
         }
+        QPushButton:disabled {
+            color: #888888;
+        }
     """)
     button.clicked.connect(
         lambda checked=False, cmd=command: send_command(cmd)
     )
     buttons_layout.addWidget(button, 1)
+
+    if command == "focus_auto":
+        autofocus_button = button
 
 off_button = QPushButton("Shutdown")
 off_button.setMinimumHeight(58)
