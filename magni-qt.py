@@ -402,11 +402,36 @@ def quit():
     for dev in devices:
         dev.ungrab()
 
+# Shared destination settings written by magni_touch.py.
+SAVE_PATHS_FILE = os.path.expanduser("~/.config/magni/paths.json")
+DEFAULT_IMAGE_SAVE_PATH = "/home/pi"
+DEFAULT_VIDEO_SAVE_PATH = "/home/pi/Videos/Magni"
+
+def load_save_paths():
+    """Read the current photo/video folders from the shared settings file."""
+    paths = {
+        "image_save_path": DEFAULT_IMAGE_SAVE_PATH,
+        "video_save_path": DEFAULT_VIDEO_SAVE_PATH,
+    }
+    try:
+        with open(SAVE_PATHS_FILE, "r", encoding="utf-8") as config_file:
+            saved = json.load(config_file)
+        if isinstance(saved, dict):
+            for key in paths:
+                value = saved.get(key)
+                if isinstance(value, str) and value.strip():
+                    paths[key] = os.path.expanduser(value.strip())
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    return paths
+
 def save_photo(filename = ''):
     global camera
     if len(filename) == 0:
+        image_dir = load_save_paths()["image_save_path"]
+        os.makedirs(image_dir, exist_ok=True)
         timestamp = datetime.now().isoformat()
-        filename = f'/home/pi/{timestamp}.jpg'
+        filename = os.path.join(image_dir, f'{timestamp}.jpg')
     if hasattr(camera, 'capture_file'):
         # saves the preview stream as an image
         camera.capture_file(filename)
@@ -426,8 +451,8 @@ def start_video_recording():
     if not hasattr(camera, "start_recording"):
         raise RuntimeError("Video recording requires Picamera2.")
 
-    # Ensure the destination directory exists.
-    video_dir = os.path.expanduser("~/Videos/Magni")
+    # Use the folder selected in touchscreen Settings.
+    video_dir = load_save_paths()["video_save_path"]
     os.makedirs(video_dir, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

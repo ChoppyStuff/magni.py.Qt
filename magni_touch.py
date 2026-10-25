@@ -22,7 +22,9 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QGridLayout,
     QFrame,
-    QCheckBox
+    QCheckBox,
+    QLineEdit,
+    QFileDialog,
 )
 
 HOST = "127.0.0.1"
@@ -190,6 +192,7 @@ def shutdown_pi():
         QMessageBox.critical(window, "Shutdown error", str(exc))
 
 app = QApplication(sys.argv)
+
 app.setApplicationName("Magni Touch Controls")
 
 window = QWidget()
@@ -321,6 +324,42 @@ controls_layout.setVerticalSpacing(2)
 body_layout.addWidget(controls_panel, 3)
 
 preferences = QSettings("Magni", "MagniTouch")
+
+# Shared with magni-qt.py through a small JSON file.
+SAVE_PATHS_FILE = os.path.expanduser("~/.config/magni/paths.json")
+DEFAULT_IMAGE_SAVE_PATH = "/home/pi"
+DEFAULT_VIDEO_SAVE_PATH = "/home/pi/Videos/Magni"
+
+def load_save_paths():
+    """Load image/video destinations shared with the camera process."""
+    paths = {
+        "image_save_path": DEFAULT_IMAGE_SAVE_PATH,
+        "video_save_path": DEFAULT_VIDEO_SAVE_PATH,
+    }
+    try:
+        with open(SAVE_PATHS_FILE, "r", encoding="utf-8") as config_file:
+            saved = json.load(config_file)
+        if isinstance(saved, dict):
+            for key in paths:
+                value = saved.get(key)
+                if isinstance(value, str) and value.strip():
+                    paths[key] = os.path.expanduser(value.strip())
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    return paths
+
+def save_save_paths(image_path, video_path):
+    """Persist the destinations for both the touchscreen and camera process."""
+    config_dir = os.path.dirname(SAVE_PATHS_FILE)
+    os.makedirs(config_dir, exist_ok=True)
+    paths = {
+        "image_save_path": os.path.expanduser(image_path.strip()),
+        "video_save_path": os.path.expanduser(video_path.strip()),
+    }
+    with open(SAVE_PATHS_FILE, "w", encoding="utf-8") as config_file:
+        json.dump(paths, config_file, indent=2)
+        config_file.write("\n")
+
 advanced_info_enabled = preferences.value(
     "advanced_info_enabled", False, type=bool
 )
@@ -411,7 +450,7 @@ if display_rotation:
 
 
 def open_settings():
-    """Open settings and save the advanced-information preference."""
+    """Open settings and save camera preferences and file destinations."""
     global advanced_info_enabled, slow_frame_rate_enabled
 
     dialog = QDialog(window)
@@ -420,37 +459,74 @@ def open_settings():
     dialog.setWindowModality(Qt.ApplicationModal)
     dialog.setStyleSheet("""
         QDialog { background: #202020; color: white; }
-        QLabel { color: white; font-size: 23px; }
-        QCheckBox { color: white; font-size: 22px; spacing: 14px; }
-        QCheckBox::indicator { width: 32px; height: 32px; }
-        QPushButton { min-height: 64px; font-size: 22px; }
+        QLabel { color: white; font-size: 21px; }
+        QCheckBox { color: white; font-size: 20px; spacing: 12px; }
+        QCheckBox::indicator { width: 30px; height: 30px; }
+        QLineEdit {
+            color: white; background: #303030; border: 2px solid #777;
+            border-radius: 6px; padding: 5px; font-size: 17px; min-height: 38px;
+        }
+        QPushButton { min-height: 52px; font-size: 19px; }
     """)
 
     dialog_layout = QVBoxLayout(dialog)
-    dialog_layout.setContentsMargins(24, 28, 24, 28)
-    dialog_layout.setSpacing(22)
+    dialog_layout.setContentsMargins(20, 16, 20, 16)
+    dialog_layout.setSpacing(10)
 
     heading = QLabel("SETTINGS")
-    heading.setStyleSheet("font-size: 30px; font-weight: bold;")
+    heading.setStyleSheet("font-size: 28px; font-weight: bold;")
     heading.setAlignment(Qt.AlignCenter)
     dialog_layout.addWidget(heading)
 
     advanced_checkbox = QCheckBox("Show advanced camera information")
     advanced_checkbox.setChecked(advanced_info_enabled)
     dialog_layout.addWidget(advanced_checkbox)
-    
-    slow_rate_checkbox = QCheckBox(
-    "Reduce frame rate for colour processing"
-    )
+
+    slow_rate_checkbox = QCheckBox("Reduce frame rate for colour processing")
     slow_rate_checkbox.setChecked(slow_frame_rate_enabled)
     dialog_layout.addWidget(slow_rate_checkbox)
-    
+
+    saved_paths = load_save_paths()
+    image_path_edit = QLineEdit(saved_paths["image_save_path"])
+    image_path_edit.setPlaceholderText("Folder for saved photos")
+    video_path_edit = QLineEdit(saved_paths["video_save_path"])
+    video_path_edit.setPlaceholderText("Folder for saved videos")
+
+    def browse_for_folder(line_edit, title):
+        current = os.path.expanduser(line_edit.text().strip() or "~")
+        if not os.path.isdir(current):
+            current = os.path.expanduser("~")
+        selected = QFileDialog.getExistingDirectory(
+            dialog, title, current, QFileDialog.ShowDirsOnly
+        )
+        if selected:
+            line_edit.setText(selected)
+
+    paths_layout = QGridLayout()
+    paths_layout.setHorizontalSpacing(10)
+    paths_layout.setVerticalSpacing(6)
+    paths_layout.addWidget(QLabel("Image save location"), 0, 0)
+    paths_layout.addWidget(image_path_edit, 0, 1)
+    image_browse = QPushButton("Browse")
+    image_browse.clicked.connect(
+        lambda: browse_for_folder(image_path_edit, "Choose image save folder")
+    )
+    paths_layout.addWidget(image_browse, 0, 2)
+    paths_layout.addWidget(QLabel("Video save location"), 1, 0)
+    paths_layout.addWidget(video_path_edit, 1, 1)
+    video_browse = QPushButton("Browse")
+    video_browse.clicked.connect(
+        lambda: browse_for_folder(video_path_edit, "Choose video save folder")
+    )
+    paths_layout.addWidget(video_browse, 1, 2)
+    paths_layout.setColumnStretch(1, 1)
+    dialog_layout.addLayout(paths_layout)
+
     note = QLabel(
-        "Advanced information includes analogue gain, exposure, "
-        "focus position and FPS."
+        "Advanced information includes analogue gain, exposure, focus position and FPS."
     )
     note.setWordWrap(True)
-    note.setStyleSheet("font-size: 19px;")
+    note.setStyleSheet("font-size: 17px;")
     dialog_layout.addWidget(note)
     dialog_layout.addStretch()
 
@@ -462,26 +538,33 @@ def open_settings():
     dialog.showFullScreen()
 
     if dialog.exec_() == QDialog.Accepted:
+        image_path = image_path_edit.text().strip()
+        video_path = video_path_edit.text().strip()
+        if not image_path or not video_path:
+            QMessageBox.warning(
+                dialog, "Save locations required",
+                "Please enter a folder for both images and videos."
+            )
+            return
+
+        try:
+            save_save_paths(image_path, video_path)
+        except OSError as exc:
+            QMessageBox.critical(
+                dialog, "Could not save locations",
+                f"The save locations could not be saved:\n{exc}"
+            )
+            return
+
         advanced_info_enabled = advanced_checkbox.isChecked()
-        preferences.setValue(
-            "advanced_info_enabled",
-            advanced_info_enabled
-        )
+        preferences.setValue("advanced_info_enabled", advanced_info_enabled)
 
         requested_slow_rate = slow_rate_checkbox.isChecked()
-
-        command = (
-            "slow_rate_on"
-            if requested_slow_rate
-            else "slow_rate_off"
-        )
+        command = "slow_rate_on" if requested_slow_rate else "slow_rate_off"
 
         if send_command(command):
             slow_frame_rate_enabled = requested_slow_rate
-            preferences.setValue(
-                "slow_frame_rate_enabled",
-                slow_frame_rate_enabled
-            )
+            preferences.setValue("slow_frame_rate_enabled", slow_frame_rate_enabled)
             refresh_tech_info()
         else:
             QMessageBox.warning(
@@ -950,3 +1033,4 @@ responsive_timer.start(400)
 # Do not show fullscreen on the default screen first.
 QTimer.singleShot(300, position_window_on_touchscreen)
 sys.exit(app.exec_())
+
