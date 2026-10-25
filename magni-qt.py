@@ -178,6 +178,14 @@ def colormap(color1, color2):
         palette[i, 0, 2] = int(color1[2] + i * (color2[2] - color1[2]) / 255)
     return palette
 
+# Precompute colour palettes once, rather than rebuilding them every frame.
+COLOR_PALETTES = {}
+
+for mode in COLOR_MODES:
+    if mode is not None:
+        _, dark, light = mode
+        COLOR_PALETTES[(dark, light)] = colormap(dark, light)
+
 # called on each frame with picamera2 to modify the colors
 def color_mode_callback(request):
     # XRGB8888 uses 4 bytes per pixel.
@@ -192,8 +200,10 @@ def color_mode_callback(request):
             # Convert the image to grayscale.
             buffer = cv2.cvtColor(m.array[..., :3], cv2.COLOR_BGR2GRAY)
 
-            # Apply the selected colour map.
-            heatmap = cv2.applyColorMap(buffer, colormap(dark, light))
+            heatmap = cv2.applyColorMap(
+                buffer,
+                COLOR_PALETTES[(dark, light)]
+            )
 
             # Copy the three colour channels into the 4-channel buffer.
             m.array[..., :3] = heatmap
