@@ -32,10 +32,19 @@ except ImportError:
 
 import os                      # for background OCR and TTS process
 import re                      # for parsing fbset output
-import signal                  # to kill background process 
+import signal                  # to kill background process
+import faulthandler             # diagnostic Python stack dumps
+faulthandler.register(signal.SIGUSR1, all_threads=True)
+print('Diagnostics: send SIGUSR1 to dump Python thread stacks.', flush=True) 
 import subprocess              # for calling fbset to detect screen resolution and readout
 import sys                     # for checking if modules are loaded
 import time
+import threading
+
+# Latest camera metadata is cached from frame callbacks. Never call
+# capture_metadata() synchronously from an asyncio request handler.
+latest_camera_metadata = {}
+latest_camera_metadata_lock = threading.Lock()
 # Video recording state (Picamera2 only).
 VIDEO_WIDTH = 1280
 VIDEO_HEIGHT = 720
@@ -126,40 +135,53 @@ bg_process = None
 # fbset is supported on new and legacy OS
 # shows actual framebuffer resolution instead of physical screen size
 
-def screen_resolution_fbset():
-    # Prefer the connected HDMI monitor's advertised resolution.
-    # DRM lists the preferred mode first on this system.
-    try:
-        import glob
+def hdmi_is_connected():
+    """Return True when a DRM HDMI connector reports a connected monitor."""
+    import glob
 
-        for status_file in sorted(
-            glob.glob('/sys/class/drm/card*-HDMI-A-*/status')
-        ):
-            with open(status_file) as f:
+    status_files = sorted(
+        glob.glob('/sys/class/drm/card*-HDMI-A-*/status')
+    )
+    for status_file in status_files:
+        try:
+            with open(status_file, encoding='ascii') as f:
+                if f.read().strip() == 'connected':
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def screen_resolution_fbset():
+    """Return the preferred mode of a connected HDMI monitor.
+
+    A safe 1080p fallback is used only for camera configuration when HDMI
+    is absent; it does not cause a preview to be opened on the touchscreen.
+    """
+    import glob
+
+    for status_file in sorted(
+        glob.glob('/sys/class/drm/card*-HDMI-A-*/status')
+    ):
+        try:
+            with open(status_file, encoding='ascii') as f:
                 if f.read().strip() != 'connected':
                     continue
 
             modes_file = status_file.replace('/status', '/modes')
-
-            with open(modes_file) as f:
+            with open(modes_file, encoding='ascii') as f:
                 for line in f:
-                    match = re.fullmatch(
-                        r'\s*(\d+)x(\d+)\s*', line
-                    )
+                    match = re.fullmatch(r'\s*(\d+)x(\d+)\s*', line)
                     if match:
-                        width = int(match.group(1))
-                        height = int(match.group(2))
-                        print(
-                            f'HDMI resolution detected: '
-                            f'{width}x{height}'
-                        )
+                        width, height = map(int, match.groups())
+                        print(f'HDMI resolution detected: {width}x{height}')
                         return width, height
+        except (OSError, ValueError) as e:
+            print(f'HDMI resolution detection failed: {e}')
 
-    except (OSError, ValueError) as e:
-        print(f'HDMI resolution detection failed: {e}')
+    print('No connected HDMI monitor; using 1920x1080 camera configuration.')
+    return 1920, 1080
 
-    # Fallback to the framebuffer if HDMI detection fails.
-    return screen_resolution_fbset_fallback()
 
 # show text on screen for a duration given in seconds
 def overlay(text, duration_s = OVERLAY_DURATION_S):
@@ -224,6 +246,15 @@ def color_mode_callback(request):
 
 # called on each frame by picamera2 for modifications like color modes
 def pre_callback(request):
+    # Cache metadata while Picamera2 is delivering frames. This avoids a
+    # blocking capture_metadata() call from the asyncio control-server thread.
+    try:
+        metadata = request.get_metadata()
+        with latest_camera_metadata_lock:
+            latest_camera_metadata.update(metadata)
+    except Exception:
+        pass
+
     color_mode_callback(request)
 
     if ENABLE_OVERLAY and hasattr(overlay, 'content') and overlay.content != None:
@@ -522,7 +553,7 @@ def readout():
         bg_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True, preexec_fn=os.setsid)
 
 # start displaying the default camera view
-def init_camera(width, height):
+def init_camera(width, height, preview_enabled=True):
     try:
         # for current OS use picamera2
         picam2 = Picamera2()
@@ -543,7 +574,10 @@ def init_camera(width, height):
         picam2.configure(config)
         print("Configured camera:", picam2.camera_configuration())
         picam2.pre_callback = pre_callback
-        picam2.start_preview(Preview.QTGL, x=0, y=0, width=width, height=height) # no transform!
+        if preview_enabled:
+            picam2.start_preview(
+                Preview.QTGL, x=0, y=0, width=width, height=height
+            )  # no transform!
         picam2.start()
         picam2.set_controls({
             'Brightness': BRIGHTNESS,
@@ -571,10 +605,265 @@ def init_camera(width, height):
         # for legacy OS use picamera
         camera = PiCamera()
         camera.rotation = ROTATION
-        camera.start_preview()
+        if preview_enabled:
+            camera.start_preview()
         print('Started legacy picamera', ROTATION)
         return camera
 
+
+
+# HDMI preview management -------------------------------------------------
+# The touchscreen is reserved for Magni controls. Never let the camera
+# preview fall back onto DSI-1 when the HDMI monitor is switched off.
+camera_preview_active = False
+
+
+def stop_camera_preview():
+    """Stop the current preview window, but leave camera capture running."""
+    global camera_preview_active
+
+    if not camera_preview_active:
+        return
+
+    try:
+        camera.stop_preview()
+        print("Camera preview stopped: HDMI disconnected.")
+    except Exception as e:
+        # Keep the monitor task alive even if Picamera2 reports that the
+        # preview was already detached during HDMI hot-unplug.
+        print(f"Warning: could not stop camera preview cleanly: {e}")
+    finally:
+        camera_preview_active = False
+
+
+def start_camera_preview(width, height, x=0, y=0):
+    """Create a fresh preview window on the HDMI output."""
+    global camera_preview_active
+
+    if camera_preview_active:
+        return
+
+    if hasattr(camera, "camera_configuration"):  # Picamera2
+        camera.start_preview(
+            Preview.QTGL, x=x, y=y, width=width, height=height
+        )
+    else:  # Legacy PiCamera
+        camera.start_preview()
+
+    camera_preview_active = True
+    print(
+        f"Camera preview started for HDMI at ({x},{y}) "
+        f"with size {width}x{height}."
+    )
+
+
+
+def ensure_labwc_hdmi_preview_rule():
+    """Ensure Labwc sends Picamera2 Preview windows fullscreen to HDMI-A-1.
+
+    Back up rc.xml only when a change is actually needed.
+    """
+    from pathlib import Path
+    import shutil
+    from datetime import datetime as _datetime
+
+    config = Path.home() / ".config" / "labwc" / "rc.xml"
+    if not config.exists():
+        print(f"Labwc config not found; skipping automatic preview rule: {config}",
+              flush=True)
+        return
+
+    try:
+        original = config.read_text()
+    except Exception as exc:
+        print(f"Could not read Labwc config; leaving it unchanged: {exc}",
+              flush=True)
+        return
+
+    rule_pattern = r'<windowRule\s+title="\*Preview\*"\s*>(.*?)</windowRule>'
+    matches = list(re.finditer(rule_pattern, original,
+                               flags=re.IGNORECASE | re.DOTALL))
+    for match in matches:
+        body = match.group(1)
+        move_ok = re.search(
+            r'<action\s+name="MoveToOutput"\s+output="HDMI-A-1"\s*/>',
+            body, flags=re.IGNORECASE)
+        fullscreen_ok = re.search(
+            r'<action\s+name="ToggleFullscreen"\s*/>',
+            body, flags=re.IGNORECASE)
+        if move_ok and fullscreen_ok and move_ok.start() < fullscreen_ok.start():
+            print("Labwc HDMI fullscreen preview rule already configured; no change needed.",
+                  flush=True)
+            return
+
+    rule = (
+        '<windowRule title="*Preview*">\n'
+        '      <action name="MoveToOutput" output="HDMI-A-1" />\n'
+        '      <action name="ToggleFullscreen" />\n'
+        '    </windowRule>'
+    )
+
+    updated = re.sub(rule_pattern, '', original,
+                     flags=re.IGNORECASE | re.DOTALL)
+
+    if re.search(r'</windowRules\s*>', updated, flags=re.IGNORECASE):
+        updated = re.sub(
+            r'</windowRules\s*>',
+            '  ' + rule + '\n  </windowRules>',
+            updated, count=1, flags=re.IGNORECASE)
+    elif re.search(r'</labwc_config\s*>', updated, flags=re.IGNORECASE):
+        block = '<windowRules>\n    ' + rule + '\n  </windowRules>\n'
+        updated = re.sub(
+            r'</labwc_config\s*>',
+            block + '</labwc_config>',
+            updated, count=1, flags=re.IGNORECASE)
+    else:
+        print("Could not find a Labwc windowRules or labwc_config closing tag; "
+              "configuration left unchanged.", flush=True)
+        return
+
+    backup = config.with_name(
+        f"rc.xml.magni-backup-{_datetime.now():%Y%m%d-%H%M%S}")
+    try:
+        shutil.copy2(config, backup)
+        config.write_text(updated)
+    except Exception as exc:
+        print(f"Could not update Labwc config: {exc}", flush=True)
+        print("Previous config backup (if created): " + str(backup), flush=True)
+        return
+
+    print("Installed Labwc rule: move Preview windows to HDMI-A-1 and fullscreen.",
+          flush=True)
+    print(f"Previous Labwc config backed up to: {backup}", flush=True)
+    print("Restart Labwc or reboot for the updated rule to take effect.",
+          flush=True)
+
+def get_hdmi_layout():
+    """Return HDMI output position once Labwc has enabled the output."""
+    try:
+        result = subprocess.run(
+            ["wlr-randr"], capture_output=True, text=True,
+            timeout=3, check=True
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"Could not query wlr-randr: {e}")
+        return None
+
+    blocks = re.split(r"(?m)(?=^[^\s].*\(HDMI-A-\d+\))", result.stdout)
+    for block in blocks:
+        if "(HDMI-A-" not in block:
+            continue
+        enabled = re.search(r"(?m)^\s*Enabled:\s*(yes|no)", block)
+        position = re.search(r"(?m)^\s*Position:\s*(-?\d+),(-?\d+)", block)
+        if enabled and enabled.group(1) == "yes" and position:
+            return tuple(map(int, position.groups()))
+    return None
+
+
+async def monitor_hdmi():
+    """Monitor HDMI hotplug with explicit, flushed diagnostics."""
+    print("HDMI monitor: task started.", flush=True)
+
+    last_connector_state = None
+    last_heartbeat = time.monotonic()
+
+    while True:
+        try:
+            connected = hdmi_is_connected()
+
+            # Log every state transition, independently of preview state.
+            if connected != last_connector_state:
+                print(
+                    f"HDMI monitor: connector state changed to "
+                    f"{'CONNECTED' if connected else 'DISCONNECTED'}. "
+                    f"preview_active={camera_preview_active}",
+                    flush=True,
+                )
+                last_connector_state = connected
+
+            if not connected:
+                if camera_preview_active:
+                    print("HDMI monitor: stopping preview.", flush=True)
+                    stop_camera_preview()
+
+            elif connected and not camera_preview_active:
+                print(
+                    "HDMI monitor: HDMI is connected but preview is inactive; "
+                    "waiting for Labwc layout.",
+                    flush=True,
+                )
+
+                layout = None
+                for attempt in range(15):
+                    await asyncio.sleep(1)
+
+                    if not hdmi_is_connected():
+                        print(
+                            "HDMI monitor: HDMI disconnected during layout wait.",
+                            flush=True,
+                        )
+                        break
+
+                    layout = get_hdmi_layout()
+                    print(
+                        f"HDMI monitor: layout check {attempt + 1}/15: {layout}",
+                        flush=True,
+                    )
+
+                    if layout is not None:
+                        # Allow Labwc to finish applying the output geometry.
+                        await asyncio.sleep(1)
+                        break
+
+                if not hdmi_is_connected():
+                    continue
+
+                if layout is None:
+                    print(
+                        "HDMI monitor: HDMI is connected, but Labwc has not "
+                        "reported an enabled HDMI position; will retry.",
+                        flush=True,
+                    )
+                else:
+                    x, y = layout
+                    width, height = screen_resolution_fbset()
+                    print(
+                        f"HDMI monitor: attempting preview start at "
+                        f"({x},{y}), {width}x{height}.",
+                        flush=True,
+                    )
+                    try:
+                        start_camera_preview(width, height, x=x, y=y)
+                    except Exception as e:
+                        print(
+                            f"HDMI monitor: preview start FAILED: "
+                            f"{type(e).__name__}: {e}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"HDMI monitor: preview start returned; "
+                            f"camera_preview_active={camera_preview_active}.",
+                            flush=True,
+                        )
+
+            now = time.monotonic()
+            if now - last_heartbeat >= 10:
+                print(
+                    f"HDMI monitor heartbeat: connected={connected}, "
+                    f"preview_active={camera_preview_active}.",
+                    flush=True,
+                )
+                last_heartbeat = now
+
+        except Exception as e:
+            print(
+                f"HDMI monitor exception (will retry): "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
+
+        await asyncio.sleep(1)
 
 
 # MAGNI_CONTROL_SERVER
@@ -647,10 +936,10 @@ def get_magni_status():
         # Legacy PiCamera and cameras without reported AF controls.
         status["autofocus_supported"] = False
     
-    try:
-        metadata = camera.capture_metadata()
-    except Exception:
-        metadata = {}
+    # Read the most recently delivered frame metadata from the cache.
+    # capture_metadata() is blocking and must not run in this asyncio handler.
+    with latest_camera_metadata_lock:
+        metadata = dict(latest_camera_metadata)
 
     exposure = metadata.get("ExposureTime")
     gain = metadata.get("AnalogueGain")
@@ -658,7 +947,7 @@ def get_magni_status():
     frame_duration = metadata.get("FrameDuration")
 
     status["exposure_us"] = exposure
-    status["analogue_gain"] = gain
+    status["analogue_gain"] = round(float(gain), 5) if gain is not None else None
     status["lens_position"] = lens
     status["fps"] = (
         round(1_000_000 / frame_duration, 1)
@@ -843,6 +1132,9 @@ async def handle_events(device):
             elif code == evdev.ecodes.KEY_KP8: scale(8)
             elif code == evdev.ecodes.KEY_KP9: scale(9)
 
+# Keep Labwc's HDMI preview placement rule in sync at every startup.
+ensure_labwc_hdmi_preview_rule()
+
 button1 = Button(PIN_NUMBER_SCALE)
 button1.when_pressed = next_factor
 button2 = Button(PIN_NUMBER_COLOR)
@@ -852,7 +1144,9 @@ screen = screen_resolution_fbset()
 width, height = screen
 print(f"Camera preview resolution: {width}x{height}")
 
-camera = init_camera(width, height)
+hdmi_connected_at_start = hdmi_is_connected()
+camera = init_camera(width, height, preview_enabled=hdmi_connected_at_start)
+camera_preview_active = hdmi_connected_at_start
 #width, height = 1920, 1080
 #screen = (width, height)
 #camera = init_camera(width, height)
@@ -870,6 +1164,7 @@ try:
         asyncio.ensure_future(handle_events(device))
     loop = asyncio.get_event_loop()
     control_server = loop.run_until_complete(start_magni_control_server())
+    asyncio.ensure_future(monitor_hdmi())
     try:
         loop.run_forever()
     finally:
